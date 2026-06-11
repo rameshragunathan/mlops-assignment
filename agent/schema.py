@@ -20,7 +20,8 @@ def db_path(db_id: str) -> Path:
 
 
 def _q(ident: str) -> str:
-    """Double-quote a SQL identifier, escaping any embedded quotes."""
+    if ident is None:
+        return '"unknown"'
     return '"' + ident.replace('"', '""') + '"'
 
 

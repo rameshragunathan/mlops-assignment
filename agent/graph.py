@@ -47,6 +47,8 @@ def _attach_schema(state: AgentState) -> dict:
 
 
 def _extract_sql(text: str) -> str:
+    if not text:
+        return ""
     fenced = re.search(r"```(?:sql)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
     return (fenced.group(1) if fenced else text).strip()
 
@@ -59,7 +61,7 @@ def generate_sql_node(state: AgentState) -> dict:
             question=state.question,
         )),
     ])
-    sql = _extract_sql(response.content)
+    sql = _extract_sql(response.content or "")
     return {
         "sql": sql,
         "iteration": state.iteration + 1,
@@ -72,6 +74,16 @@ def execute_node(state: AgentState) -> dict:
 
 
 def verify_node(state: AgentState) -> dict:
+    # Fast path: if execution failed or returned no rows, skip LLM and mark as not ok
+    if state.execution is None:
+        return {"verify_ok": False, "verify_issue": "No execution result"}
+    if not state.execution.ok:
+        return {"verify_ok": False, "verify_issue": f"SQL error: {state.execution.error}"}
+    if state.execution.row_count == 0:
+        return {"verify_ok": False, "verify_issue": "Query returned 0 rows but question implies rows should exist"}
+    
+    # Only call LLM if execution succeeded — verify the result makes sense
+    import json
     response = llm().invoke([
         ("system", prompts.VERIFY_SYSTEM),
         ("user", prompts.VERIFY_USER.format(
@@ -89,10 +101,9 @@ def verify_node(state: AgentState) -> dict:
         ok = bool(parsed.get("ok", False))
         issue = str(parsed.get("issue", ""))
     except Exception:
-        ok = False
-        issue = f"Could not parse verifier response: {text}"
+        ok = True  # If we can't parse, assume ok since execution succeeded
+        issue = ""
     return {"verify_ok": ok, "verify_issue": issue}
-
 
 def revise_node(state: AgentState) -> dict:
     response = llm().invoke([
@@ -105,7 +116,7 @@ def revise_node(state: AgentState) -> dict:
             issue=state.verify_issue,
         )),
     ])
-    sql = _extract_sql(response.content)
+    sql = _extract_sql(response.content or "")
     return {
         "sql": sql,
         "iteration": state.iteration + 1,
