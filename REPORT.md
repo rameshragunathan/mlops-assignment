@@ -47,12 +47,14 @@ Metric: execution accuracy — gold SQL and agent SQL run against the same DB, r
 
 | Iteration | Pass Rate |
 |-----------|-----------|
-| 1 (generate only) | TBD on H100 |
-| 2 (after first revise) | TBD on H100 |
-| 3 (after second revise) | TBD on H100 |
-| Final | TBD on H100 |
+| 1 (generate only) | 33.3% |
+| 2 (after first revise) | 33.3% |
+| 3 (after second revise) | 33.3% |
+| Final | 33.3% (10/30) |
 
-> Note: local dev runs on Qwen3-1.7B gave iter-1=13.3%, iter-2=20%, iter-3=20% — showing the loop helps but numbers aren't representative. Real baseline must come from Qwen3-30B-A3B on the H100.
+The loop added no value on the 30B model — all iterations came out the same. The verifier was passing results too easily, so the revise step never triggered on genuinely wrong answers. The verify prompt needs to be more strict to catch cases where the SQL returns the wrong columns or a suspiciously round number.
+
+Post-tuning eval (after the schema fix): 30% (9/30). The fix slightly hurt quality on one question — the european_football_2 schema now renders `"unknown"` for NULL FK columns which confused the model on one edge case. Acceptable tradeoff given it eliminated all 500 errors.
 
 ---
 
@@ -60,30 +62,27 @@ Metric: execution accuracy — gold SQL and agent SQL run against the same DB, r
 
 Target: P95 end-to-end agent latency < 5s, 10+ RPS over a 5-minute window.
 
-*To be completed after Phase 6 load testing on the H100.*
+**Baseline (2 RPS):** P95=6.04s, 30 HTTP 500 errors, achieved 1.33 RPS.
 
-Iteration log format (to fill in):
-```
-saw X → hypothesised Y → changed Z → result was W
-```
+**Iteration 1:** saw HTTP 500s on ~12% of requests → hypothesised schema rendering crash on the european_football_2 database which has NULL FK column names → fixed `_q()` in `agent/schema.py` to handle None gracefully → P95 dropped to 4.56s, 0 errors. P95 now under 5s SLO at 2 RPS. ✅
+
+**Iteration 2:** pushed to 10 RPS over 5 minutes → 1079 timeouts, P95=104s, only 43% of requests succeeded → SLO missed. The root cause is that agent runs make 1-2 sequential LLM calls, each ~1s. At 10 concurrent RPS that's 10-20 simultaneous vLLM requests stacking up faster than they drain. The system can sustain ~2 RPS comfortably but falls apart at 10.
+
+**Verdict:** SLO partially hit — P95 < 5s achieved at 2 RPS after fixing the 500 errors. 10 RPS target missed. Gap at 10 RPS: P95 104s vs 5s target.
 
 ---
 
 ## 5. Agent Value
 
-The verify→revise loop adds measurable value. On the local dev run (1.7B model), pass rate went from 13.3% at iteration 1 to 20% at iteration 2 — the revise step recovered 2 questions the initial generation got wrong. Iteration 3 added nothing further, which makes sense: if revision didn't fix it after one attempt, a second revision with the same context rarely does.
+On the H100 with Qwen3-30B-A3B, the verify→revise loop didn't add measurable value — pass rate was flat at 33.3% across all iterations. This is different from what the local 1.7B dev runs suggested (13.3% → 20% improvement), and the reason is clear in hindsight: the verifier on the 30B model was too lenient. It kept returning `ok=true` even on wrong answers, so revise never fired on questions that actually needed fixing.
 
-On the H100 with the 30B model, I expect the gap between iter-1 and final to be larger because:
-1. The verifier will produce valid JSON more reliably, so `ok=false` will be genuinely informative rather than a parse failure
-2. The revise prompt has the failing SQL, error message, and verifier's complaint — the 30B model is much better at using all three together
-
-The architecture earns its keep when the first SQL errors (wrong table, syntax error, wrong join) and the verifier catches it. The per-iteration pass rate from the H100 run will be the definitive evidence.
+The architecture has the right shape — the loop should help — but the verifier prompt needs to be more aggressive about catching wrong answers. With a stricter verify prompt I'd expect the loop to start earning its keep. The per-iteration pass rate being flat is the evidence that the bottleneck is in the verifier, not the reviser.
 
 ---
 
 ## 6. What I'd Do With More Time
 
-- **Generate a fused MoE kernel config for H100** — vLLM warned about missing `E=128,N=768,device_name=NVIDIA_H100_80GB_HBM3.json`. Running `vllm bench` to generate this could give a meaningful throughput improvement without changing anything else.
-- **Add prefix caching** — agent calls share large system prompts and schema blocks across questions. Prefix caching would cut TTFT significantly on repeated DB schemas.
-- **Improve the verifier prompt** — currently the verifier sees the raw row output. Adding column name context and a worked example of a bad result would reduce false positives (verify saying ok=false when the SQL was actually fine).
+- **Stricter verifier prompt** — the flat per-iteration pass rate shows the verifier is the weak link. Adding few-shot examples of bad results (wrong columns, off-by-one counts, NULL when a value is expected) would make `ok=false` fire on genuine failures rather than just errors and zero rows.
 - **Structured output for verify** — force the model to output `{"ok": ..., "issue": ...}` using vLLM's guided decoding rather than hoping the model formats JSON correctly. Would eliminate the defensive parsing fallback entirely.
+- **Generate a fused MoE kernel config for H100** — vLLM warned about missing `E=128,N=768,device_name=NVIDIA_H100_80GB_HBM3.json`. Running `vllm bench` to generate this could give a meaningful throughput improvement at 10 RPS without changing anything else.
+- **Prefix caching** — agent calls share large system prompts and schema blocks across questions from the same DB. Prefix caching would cut TTFT significantly on repeated schemas, which is exactly the pattern in a real analytics product where the same warehouse is queried repeatedly.
